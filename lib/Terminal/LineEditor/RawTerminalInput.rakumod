@@ -550,15 +550,22 @@ role Terminal::LineEditor::RawTerminalIO {
     }
 
     #| Query the terminal asynchronously and return a vowed Promise kept when
-    #| the response arrives
-    multi method query-terminal(Str:D $request, $matcher) {
+    #| the response arrives, or kept with Str after $timeout seconds if any
+    multi method query-terminal(Str:D $request, $matcher, Real :$timeout) {
         # Prepare a vowed Promise
         my $p = Promise.new;
         my $v = $p.vow;
+        my $lock = Lock.new;
+        my sub keep($response) {
+            $lock.protect: { $v.keep($response) if $p.status ~~ Planned }
+        }
 
-        # Add an active query record that will keep the vow
-        my &callback = { $v.keep($_) };
+        # Add an active query record that will keep the vow; on timeout the
+        # record stays active, so that a late response is still consumed by
+        # this query and not mistaken for the response to a later one
+        my &callback = { keep($_) };
         self.query-terminal($request, $matcher, &callback);
+        Promise.in($timeout).then({ keep(Str) }) with $timeout;
 
         # Return Promise
         $p
@@ -569,18 +576,20 @@ role Terminal::LineEditor::RawTerminalIO {
 #| Role with utility methods for raw terminal I/O
 role Terminal::LineEditor::RawTerminalUtils {
     #| Detect cursor position, returning a Promise that will be kept with
-    #| (row, col) or Empty if unable
-    method detect-cursor-pos() {
+    #| (row, col) or Empty if unable, including when the terminal does not
+    #| answer within $timeout seconds
+    method detect-cursor-pos(Real :$timeout) {
         my regex response { ^ "\e[" (\d+) ';' (\d+) 'R' $ }
 
-        self.query-terminal("\e[6n", &response).then: {
-            (~.result) ~~ &response ?? (+$0, +$1) !! Empty
+        self.query-terminal("\e[6n", &response, :$timeout).then: {
+            .result.defined && (~.result) ~~ &response ?? (+$0, +$1) !! Empty
         }
     }
 
     #| Detect terminal size, returning a Promise that will be kept with
-    #| (rows, cols) or Empty if unable
-    method detect-terminal-size() {
+    #| (rows, cols) or Empty if unable, including when the terminal does not
+    #| answer within $timeout seconds
+    method detect-terminal-size(Real :$timeout) {
         # XXXX: This query has been found to have compatibility problems; it
         #       works in xterm and libvte terminals, but not in many others
         #       such as Konsole, Windows Console, linux, etc.
@@ -592,7 +601,7 @@ role Terminal::LineEditor::RawTerminalUtils {
         # the terminal, detecting the cursor position, and restoring the cursor.
 
         $.output.print("\e7\e[9999;9999H");
-        my $p := self.detect-cursor-pos;
+        my $p := self.detect-cursor-pos(:$timeout);
         $.output.print("\e8");
         $p
     }
@@ -692,6 +701,10 @@ class Terminal::LineEditor::CLIInput
     has $.input-field;
     has &.get-completions;
 
+    #| Seconds to wait for the terminal to answer each query (cursor position,
+    #| terminal size) before falling back to defaults
+    has Real:D $.query-timeout = 1;
+
     #| Start the decoder reactor as soon as everything else is set up
     submethod TWEAK() {
         self.start-decoder;
@@ -764,12 +777,20 @@ class Terminal::LineEditor::CLIInput
             self.clear-input-field;
         }
 
-        # Detect current cursor position and terminal size
-        my ($row,  $col)  = await self.detect-cursor-pos;
-        my ($rows, $cols) = await self.detect-terminal-size;
+        # Detect current cursor position and terminal size, falling back to
+        # the first column of an 80-column terminal if the terminal does not
+        # answer
+        # (both queries are sent before waiting, so they wait concurrently)
+        my $timeout = $.query-timeout;
+        my $pos     = self.detect-cursor-pos(:$timeout);
+        my $size    = self.detect-terminal-size(:$timeout);
+        my ($row,  $col)  = await $pos;
+        my ($rows, $cols) = await $size;
+        $col  //= 1;
+        $cols //= 80;
 
         # Set up an editable input buffer
-        my $display-width = ($cols //= 80) - $col;
+        my $display-width = $cols - $col;
         self.replace-input-field(:$display-width, :field-start($col), :$mask);
 
         # History helpers
