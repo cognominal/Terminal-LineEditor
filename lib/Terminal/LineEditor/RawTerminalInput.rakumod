@@ -761,9 +761,12 @@ class Terminal::LineEditor::CLIInput
         self.do-edit('insert-string', $content);
     }
 
-    #| Full input/edit loop; returns final user input or Str if aborted
+    #| Full input/edit loop; returns final user input or Str if aborted.
+    #| &on-finish, if given, is called with the buffer contents when the user
+    #| asks to finish (Enter); it returns True to finish, False to ignore the
+    #| request, or a string that replaces the buffer contents, editing going on.
     # XXXX: Bool:D :$history = False, Str:D :$context = 'default',
-    method read-input(Str :$mask, :&on-suspend, :&on-continue --> Str) {
+    method read-input(Str :$mask, :&on-suspend, :&on-continue, :&on-finish --> Str) {
         # If not a terminal, just read a line from input and return it
         return $.input.get // Str unless $.input.t;
 
@@ -857,6 +860,19 @@ class Terminal::LineEditor::CLIInput
             $.output.flush;
         }
 
+        # Finish, unless &on-finish says otherwise
+        my sub do-finish() {
+            my $verdict = &on-finish ?? on-finish($.input-field.buffer.contents) !! True;
+            if $verdict ~~ Str:D {
+                self.replace-input-field(:$display-width, :field-start($col),
+                                         :$mask, :content($verdict));
+            }
+            elsif $verdict {
+                self.set-done;
+                done;
+            }
+        }
+
         # If not currently completing, all other actions reset completions
         my sub reset-completions() {
             $completions      = Nil;
@@ -913,7 +929,7 @@ class Terminal::LineEditor::CLIInput
                     when 'suspend'         { self.suspend(:&on-suspend, :&on-continue);
                                              $.input-field.force-pos-to-start;
                                              self.do-edit('insert-string', ''); }
-                    when 'finish'          { self.set-done; done }
+                    when 'finish'          { do-finish }
                     when 'abort-input'     { self.set-done; $aborted = True; done }
                     when 'abort-or-delete' { unless $.input-field.buffer.contents {
                                                    self.set-done;
@@ -930,14 +946,15 @@ class Terminal::LineEditor::CLIInput
         $aborted ?? Str !! $.input-field.buffer.contents
     }
 
-    #| Print and flush prompt then enter input loop, optionally masking password
-    method prompt(Str:D $prompt = '', Str :$mask --> Str) {
+    #| Print and flush prompt then enter input loop, optionally masking
+    #| password; see read-input for &on-finish
+    method prompt(Str:D $prompt = '', Str :$mask, :&on-finish --> Str) {
         my sub flush-prompt() {
             $.output.print($prompt);
             $.output.flush;
         }
 
         flush-prompt;
-        self.read-input(:$mask, :on-continue(&flush-prompt))
+        self.read-input(:$mask, :on-continue(&flush-prompt), :&on-finish)
     }
 }
