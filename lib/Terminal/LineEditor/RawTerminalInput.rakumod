@@ -298,6 +298,39 @@ role Terminal::LineEditor::KeyMappable {
 }
 
 
+#| A pollfd entry for poll(2)
+class Terminal::LineEditor::PollFD is repr('CStruct') {
+    has int32 $.fd;
+    has int16 $.events;
+    has int16 $.revents;
+}
+
+#| Wait up to $ms milliseconds for input on file descriptor $fd. Returns True
+#| when there is input to read, or when the input is closed or in error, so
+#| that the next read reports it. Without poll(2), always returns True.
+sub input-ready(Int:D $fd, Int:D $ms --> Bool:D) {
+    return True if $*DISTRO.is-win;
+
+    use NativeCall;
+    sub poll(Terminal::LineEditor::PollFD, uint64, int32 --> int32) is native {*}
+
+    # POLLIN is 1. A signal interrupts poll with -1, which counts as no input.
+    poll(Terminal::LineEditor::PollFD.new(:$fd, :events(1)), 1, $ms) > 0
+}
+
+#| Read one byte from file descriptor $fd with read(2). Returns the byte, or an
+#| empty Buf at the end of input or on error. The read goes to the descriptor
+#| because IO::Handle.read reads ahead into its decoder, where poll(2) does not
+#| see the bytes.
+sub read-byte(Int:D $fd --> Buf:D) {
+    use NativeCall;
+    sub read(int32, Buf, size_t --> ssize_t) is native {*}
+
+    my $buf = buf8.allocate(1);
+    read($fd, $buf, 1) == 1 ?? $buf !! buf8.new
+}
+
+
 #| Class for active terminal queries
 class Terminal::LineEditor::Query {
     has Str:D $.request  is required;
@@ -316,6 +349,7 @@ role Terminal::LineEditor::RawTerminalIO {
     has Supplier::Preserving:D $!dec-supplier .= new;
     has Supply:D               $.decoded       = $!dec-supplier.Supply;
     has atomicint              $!done          = 0;
+    has atomicint              $!parser-generation = 0;
     has                        $!parse         = make-ansi-parser(emit-item => { $!raw-supplier.emit($_) });
     has MouseEventMode:D       $!previous-mouse-mode = MouseNoEvents;
     has BracketedPasteMode:D   $.current-paste-mode  = PasteNoBrackets;
@@ -331,13 +365,14 @@ role Terminal::LineEditor::RawTerminalIO {
     #| Switch input to raw mode if it's a TTY and not already in raw mode
     method enter-raw-mode() {
         # If input is a TTY and not currently in raw mode (with a saved
-        # termios), then start the parser, save current TTY mode, flush
-        # previous I/O, and convert TTY to raw mode
+        # termios), then start the parser, save current TTY mode, drain
+        # previous output, and convert TTY to raw mode. Unread input is kept,
+        # so that keys typed ahead reach the next prompt.
 
         if $.input.t && !$!saved-term-config {
             $!saved-fd = $.input.native-descriptor;
             $!saved-term-config = Terminal::API::get-config($!saved-fd);
-            Terminal::API::make-raw($!saved-fd, :when(Terminal::API::FLUSH));
+            Terminal::API::make-raw($!saved-fd, :when(Terminal::API::DRAIN));
 
             $!done ⚛= 0;
             self.start-parser;
@@ -387,16 +422,36 @@ role Terminal::LineEditor::RawTerminalIO {
     #| appear at $!raw-supply, _in tokenized form_ (as codepoints and buffers
     #| that must be further decoded into input events)
     method start-parser() {
+        # A parser stops when input is done or when a newer parser starts.
+        # It waits for input in short slices, so that once stopped it does not
+        # stay blocked in read and take the next reader's first byte. The
+        # next reader is the next parser, or a program that the caller runs
+        # after leaving raw mode.
+        my int $generation = ++⚛$!parser-generation;
+        my     $fd         = $.input.native-descriptor;
+        my sub stopped() { ⚛$!done || ⚛$!parser-generation != $generation }
+
         start {
-            LOOP: until ⚛$!done {
+            LOOP: until stopped() {
                 my $buf = Buf.new;
 
                 repeat {
-                    my $b = $.input.read(1) or last LOOP;
+                    my $b;
+                    if $*DISTRO.is-win {
+                        $b = $.input.read(1);
+                    }
+                    else {
+                        repeat { last LOOP if stopped() } until input-ready($fd, 50);
+                        last LOOP if stopped();
+                        $b = read-byte($fd);
+                    }
+                    last LOOP unless $b;
                     $buf.push($b);
-                } until ⚛$!done || try my $c = $buf.decode;
+                } until stopped() || try my $c = $buf.decode;
 
-                $!parse($c.ord) unless ⚛$!done;
+                # A byte that was read is parsed even after the parser stopped,
+                # so that the next prompt gets it as typed-ahead input.
+                $!parse($c.ord) with $c;
             }
         }
     }
